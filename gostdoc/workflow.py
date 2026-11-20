@@ -17,7 +17,9 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm
 
-from .formatter import Profile, STANDARD, diagnostics, get_document, is_heading, is_list
+from .formatter import MISIS, Profile, STANDARD, diagnostics, get_document, is_heading, is_list, table_neighbors
+from .document import iter_tables
+from .table_audit import audit_tables
 
 PROFILE_KEYS = {field.name for field in fields(Profile)}
 MAX_BATCH_FILES = 10
@@ -109,8 +111,10 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
         else:
             add('Замечание', 'Абзацы', item['Элемент'], detail)
 
+    captions = {caption._p for _, table in iter_tables(doc)
+                for caption, _ in [table_neighbors(table)] if caption is not None} if cfg.ruleset == 'misis' else set()
     for i, p in enumerate(doc.paragraphs, 1):
-        if not p.text.strip() or is_heading(p) or is_list(p):
+        if not p.text.strip() or is_heading(p) or is_list(p) or p._p in captions:
             continue
         loc = f'Абзац {i}'
         sp = p.paragraph_format.line_spacing
@@ -137,6 +141,7 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
                     add('Замечание', 'Цвет', loc, 'Текст не чёрный.')
             break
 
+    issues.extend(audit_tables(doc, cfg))
     if doc.tables:
         add('Проверить вручную', 'Таблицы', 'Документ',
             f'Таблиц: {len(doc.tables)}. Проверь подписи, повтор заголовков и переносы между страницами.')
@@ -146,6 +151,10 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     if not any(is_heading(p) for p in doc.paragraphs):
         add('Проверить вручную', 'Структура', 'Документ',
             'Не распознаны заголовки. Применяй стили Word «Заголовок 1–3» для содержания.')
+    if cfg.ruleset == 'misis':
+        add('Проверить вручную', 'Методичка МИСИС', 'Документ',
+            'Контекстные интервалы и нумерация заголовков, кафедральный титул, содержание, '
+            'формулы, ссылки, источники и реальная вёрстка не проходят полный автоматический контроль.')
 
     # Deduplicate when a basic diagnostic and a style-based check describe one issue.
     seen = set()
@@ -187,8 +196,11 @@ def profile_from_json(data: bytes) -> Profile:
         payload = json.loads(data.decode('utf-8-sig'))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError('Некорректный JSON профиля.') from exc
-    if not isinstance(payload, dict) or set(payload) != PROFILE_KEYS:
-        raise ValueError('Файл должен содержать ровно параметры профиля GOST DOC.')
+    legacy_keys = PROFILE_KEYS - {'ruleset', 'table_size', 'table_line_spacing'}
+    if not isinstance(payload, dict) or not legacy_keys <= set(payload) <= PROFILE_KEYS:
+        raise ValueError('Файл должен содержать параметры профиля GOST DOC без неизвестных полей.')
+    if payload.get('ruleset', 'generic') not in ('generic', 'misis', 'custom'):
+        raise ValueError('Неизвестный набор требований профиля.')
     if not isinstance(payload['font'], str) or payload['font'] not in (
         'Times New Roman', 'Arial', 'Calibri',
     ):
@@ -206,7 +218,14 @@ def profile_from_json(data: bytes) -> Profile:
         value = payload[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
             raise ValueError(f'Недопустимое значение параметра {name}.')
-    return Profile(**payload)
+    for name, low, high in [('table_size', 8, 18), ('table_line_spacing', 1, 2)]:
+        value = payload.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high):
+            raise ValueError(f'Недопустимое значение параметра {name}.')
+    profile = Profile(**payload)
+    if profile.ruleset == 'misis' and profile != MISIS:
+        raise ValueError('Профиль МИСИС фиксирован методичкой. Для других параметров выберите ruleset="custom".')
+    return profile
 
 
 def safe_docx_filename(name: str) -> str:
@@ -243,6 +262,17 @@ def demo_docx() -> bytes:
     p.runs[0].font.size = __import__('docx').shared.Pt(16)
     doc.add_heading('1 Общие положения', level=1)
     doc.add_paragraph('Загрузите этот файл в GOST DOC и оцените найденные замечания.')
+    doc.add_paragraph('Таблица 1 – Демонстрационные результаты')
+    table = doc.add_table(rows=2, cols=2)
+    for row, values in zip(table.rows, [('Показатель', 'Значение'), ('Тестовый результат', '42')]):
+        for cell, value in zip(row.cells, values):
+            cell.text = value
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            paragraph.paragraph_format.first_line_indent = Cm(1.25)
+            paragraph.paragraph_format.line_spacing = 1.5
+            paragraph.runs[0].font.size = __import__('docx').shared.Pt(12)
+    doc.add_paragraph('Таким образом, проверка должна найти и исправить параметры таблицы.')
     section = doc.sections[0]
     section.left_margin = Cm(1)
     section.right_margin = Cm(1)

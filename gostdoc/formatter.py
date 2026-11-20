@@ -7,15 +7,18 @@ from __future__ import annotations
 import io
 import re
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Optional
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docx.shared import Cm, Pt, RGBColor
+
+from .document import iter_cells, iter_runs, iter_tables
 
 MAX_BYTES = 15 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
@@ -37,12 +40,20 @@ class Profile:
     right_cm: float = 1.5
     top_cm: float = 2.0
     bottom_cm: float = 2.0
+    ruleset: str = 'generic'
+    table_size: Optional[float] = None
+    table_line_spacing: Optional[float] = None
 
     def summary(self):
         return asdict(self)
 
+    def for_table(self):
+        return replace(self, size=self.table_size if self.table_size is not None else self.size,
+                       line_spacing=self.table_line_spacing if self.table_line_spacing is not None else self.line_spacing)
+
 
 STANDARD = Profile()
+MISIS = Profile(ruleset='misis', table_size=10, table_line_spacing=1.0)
 
 
 def validate_docx(content: bytes) -> None:
@@ -87,6 +98,8 @@ def set_font(style_or_run, profile: Profile, bold: Optional[bool] = None):
             rpr.insert(0, rfonts)
         for key in ('ascii', 'hAnsi', 'eastAsia', 'cs'):
             rfonts.set(qn(f'w:{key}'), profile.font)
+        for key in ('asciiTheme', 'hAnsiTheme', 'eastAsiaTheme', 'csTheme', 'cstheme'):
+            rfonts.attrib.pop(qn(f'w:{key}'), None)
 
 
 def is_heading(paragraph) -> int:
@@ -148,6 +161,88 @@ def process_paragraph(paragraph, cfg: Profile, *, treat_as_heading: bool, allow_
         pf.first_line_indent = Cm(cfg.first_line_cm)
         for run in paragraph.runs:
             set_font(run, cfg)
+
+
+def format_table_paragraph(paragraph, cfg):
+    """Table-specific direct properties also protect empty cells from Normal."""
+    pf = paragraph.paragraph_format
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    pf.left_indent = pf.right_indent = pf.first_line_indent = Cm(0)
+    pf.space_before = pf.space_after = Pt(0)
+    pf.line_spacing = cfg.line_spacing
+    for run in iter_runs(paragraph):
+        set_font(run, cfg)
+    # Empty cells need a paragraph-mark size too, for text entered later in Word.
+    ppr = paragraph._p.get_or_add_pPr()
+    rpr = ppr.find(qn('w:rPr'))
+    if rpr is None:
+        rpr = OxmlElement('w:rPr')
+        ppr.append(rpr)
+    for name, value in [('rFonts', cfg.font), ('sz', str(int(cfg.size * 2)))]:
+        node = rpr.find(qn(f'w:{name}'))
+        if node is None:
+            node = OxmlElement(f'w:{name}')
+            rpr.append(node)
+        if name == 'rFonts':
+            for key in ('ascii', 'hAnsi', 'eastAsia', 'cs'):
+                node.set(qn(f'w:{key}'), value)
+            for key in ('asciiTheme', 'hAnsiTheme', 'eastAsiaTheme', 'csTheme', 'cstheme'):
+                node.attrib.pop(qn(f'w:{key}'), None)
+        else:
+            node.set(qn('w:val'), value)
+
+
+def table_neighbors(table):
+    """Only unambiguous adjacent captions/body text; don't invent missing text."""
+    # A caption inside a parent cell is still table content (10 pt), not body
+    # text (12 pt). Do not impose conflicting surrounding-body rules on it.
+    if table._tbl.getparent().tag != qn('w:body'):
+        return None, None
+    previous, following = table._tbl.getprevious(), table._tbl.getnext()
+    caption = None
+    if previous is not None and previous.tag == qn('w:p'):
+        p = Paragraph(previous, table._parent)
+        if re.match(r'^(?:Таблица|Продолжение таблицы)\s+(?:\d+|[А-ЯЁ]\.\d+)(?:\s|[–—.-]|$)', p.text.strip()):
+            caption = p
+    after = None
+    if following is not None and following.tag == qn('w:p'):
+        p = Paragraph(following, table._parent)
+        if p.text.strip() and not is_heading(p) and not is_list(p) and not re.match(
+                r'^(?:Рисунок|Таблица|Продолжение таблицы)\s', p.text.strip()):
+            after = p
+    return caption, after
+
+
+def format_table(table, cfg):
+    table_cfg = cfg.for_table()
+    if cfg.ruleset == 'misis':
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        width = table._tbl.tblPr.find(qn('w:tblW'))
+        if width is None:
+            width = OxmlElement('w:tblW')
+            table._tbl.tblPr.append(width)
+        width.set(qn('w:type'), 'pct')
+        width.set(qn('w:w'), '5000')
+    for _, _, cell in iter_cells(table):
+        if cfg.ruleset == 'misis':
+            tcpr = cell._tc.get_or_add_tcPr()
+            shading = tcpr.find(qn('w:shd'))
+            if shading is None:
+                shading = OxmlElement('w:shd')
+                tcpr.append(shading)
+            shading.set(qn('w:val'), 'clear')
+            shading.set(qn('w:fill'), 'auto')
+            shading.set(qn('w:color'), 'auto')
+            for key in ('themeFill', 'themeFillTint', 'themeFillShade', 'themeColor', 'themeTint', 'themeShade'):
+                shading.attrib.pop(qn(f'w:{key}'), None)
+        for p in cell.paragraphs:
+            format_table_paragraph(p, table_cfg)
+    if cfg.ruleset == 'misis':
+        caption, after = table_neighbors(table)
+        if caption is not None:
+            format_table_paragraph(caption, cfg)
+        if after is not None:
+            after.paragraph_format.space_before = Pt(6)
 
 
 def ensure_page_field(paragraph) -> None:
@@ -252,6 +347,9 @@ def format_docx(content: bytes, cfg: Profile = STANDARD, *, add_title: bool = Fa
     original_first = doc.element.body[0] if len(doc.element.body) else None
     before_text = extract_text(doc)
     warnings: list[str] = []
+    if cfg.ruleset == 'misis':
+        warnings.append('МИСИС: контекстные интервалы и нумерацию заголовков, кафедральный титул, '
+                        'содержание, ссылки, формулы и вёрстку проверьте в Word. Это не полный нормоконтроль.')
 
     for section in doc.sections:
         section.page_width = Cm(21)
@@ -280,11 +378,8 @@ def format_docx(content: bytes, cfg: Profile = STANDARD, *, add_title: bool = Fa
         process_paragraph(p, cfg, treat_as_heading=bool(level))
 
     if format_tables:
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        process_paragraph(p, cfg, treat_as_heading=False, allow_style=False)
+        for _, table in iter_tables(doc):
+            format_table(table, cfg)
     if doc.tables:
         warnings.append('Проверьте таблицы: ширину, переносы, подписи, объединённые ячейки и разбиение по страницам.')
     if doc.inline_shapes:
@@ -319,6 +414,8 @@ def extract_text(doc) -> str:
 def diagnostics(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     doc = get_document(content)
     found = []
+    captions = {caption._p for _, table in iter_tables(doc)
+                for caption, _ in [table_neighbors(table)] if caption is not None} if cfg.ruleset == 'misis' else set()
     for i, sec in enumerate(doc.sections, 1):
         for key, actual, expected in (
             ('Левое поле', sec.left_margin.cm, cfg.left_cm),
@@ -334,7 +431,7 @@ def diagnostics(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
         if not p.text.strip():
             continue
         head = bool(is_heading(p))
-        if not head and not is_list(p):
+        if not head and not is_list(p) and p._p not in captions:
             if p.alignment not in (None, WD_ALIGN_PARAGRAPH.JUSTIFY):
                 found.append({'Элемент': f'Абзац {i}', 'Проблема': 'Выравнивание не по ширине'})
             if p.paragraph_format.first_line_indent is not None:
