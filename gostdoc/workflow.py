@@ -17,7 +17,9 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm
 
-from .formatter import Profile, STANDARD, diagnostics, get_document, is_heading, is_list
+from .formatter import MISIS, Profile, STANDARD, diagnostics, get_document, is_heading, is_list, table_neighbors
+from .document import iter_tables
+from .table_audit import audit_tables
 
 PROFILE_KEYS = {field.name for field in fields(Profile)}
 MAX_BATCH_FILES = 10
@@ -91,6 +93,8 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     """
     doc = get_document(content)
     issues = []
+    if cfg.ruleset == 'misis' and cfg != MISIS:
+        raise ValueError('Параметры МИСИС должны совпадать с методичкой.')
 
     def add(level: str, kind: str, location: str, details: str):
         issues.append({
@@ -102,6 +106,8 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
 
     for item in diagnostics(content, cfg):
         detail = item['Проблема']
+        if cfg.ruleset == 'misis' and not item['Элемент'].startswith('Раздел '):
+            continue  # Role-aware checks below replace overlapping basic checks.
         if detail.startswith(('Левое', 'Правое', 'Верхнее', 'Нижнее', 'Формат')):
             add('Ошибка', 'Страница', item['Элемент'], detail)
         elif detail.startswith('Шрифт') or detail.startswith('Размер'):
@@ -109,8 +115,12 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
         else:
             add('Замечание', 'Абзацы', item['Элемент'], detail)
 
+    captions = {caption._p for _, table in iter_tables(doc)
+                for caption, _ in [table_neighbors(table)] if caption is not None} if cfg.ruleset == 'misis' else set()
     for i, p in enumerate(doc.paragraphs, 1):
-        if not p.text.strip() or is_heading(p) or is_list(p):
+        if cfg.ruleset == 'misis':
+            continue
+        if not p.text.strip() or is_heading(p) or is_list(p) or p._p in captions:
             continue
         loc = f'Абзац {i}'
         sp = p.paragraph_format.line_spacing
@@ -137,6 +147,10 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
                     add('Замечание', 'Цвет', loc, 'Текст не чёрный.')
             break
 
+    if cfg.ruleset == 'misis':
+        from .misis import audit_paragraphs
+        issues.extend(audit_paragraphs(doc, cfg))
+    issues.extend(audit_tables(doc, cfg))
     if doc.tables:
         add('Проверить вручную', 'Таблицы', 'Документ',
             f'Таблиц: {len(doc.tables)}. Проверь подписи, повтор заголовков и переносы между страницами.')
@@ -146,6 +160,16 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     if not any(is_heading(p) for p in doc.paragraphs):
         add('Проверить вручную', 'Структура', 'Документ',
             'Не распознаны заголовки. Применяй стили Word «Заголовок 1–3» для содержания.')
+    if cfg.ruleset == 'misis':
+        add('Проверить вручную', 'Методичка МИСИС', 'Документ',
+            'Контекстные интервалы и нумерация заголовков, кафедральный титул, содержание, '
+            'формулы, ссылки, источники и реальная вёрстка не проходят полный автоматический контроль.')
+        if not any(re.search(r'\bцел(?:ь|ью|и)\b', p.text, re.I) for p in doc.paragraphs):
+            add('Проверить вручную', 'Содержание работы', 'Документ',
+                'Не найдена явно обозначенная цель работы. Проверьте требование стр. 5; цель не добавляется автоматически.')
+        if doc.element.xpath('.//w:sdt'):
+            add('Проверить вручную', 'Элементы управления Word', 'Документ',
+                'Обнаружены элементы Rich Text/SDT. Их содержимое сохраняется; проверьте вложенные стили и титульник по стр. 14–15.')
 
     # Deduplicate when a basic diagnostic and a style-based check describe one issue.
     seen = set()
@@ -187,8 +211,11 @@ def profile_from_json(data: bytes) -> Profile:
         payload = json.loads(data.decode('utf-8-sig'))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError('Некорректный JSON профиля.') from exc
-    if not isinstance(payload, dict) or set(payload) != PROFILE_KEYS:
-        raise ValueError('Файл должен содержать ровно параметры профиля GOST DOC.')
+    legacy_keys = PROFILE_KEYS - {'ruleset', 'table_size', 'table_line_spacing'}
+    if not isinstance(payload, dict) or not legacy_keys <= set(payload) <= PROFILE_KEYS:
+        raise ValueError('Файл должен содержать параметры профиля GOST DOC без неизвестных полей.')
+    if payload.get('ruleset', 'generic') not in ('generic', 'misis', 'custom'):
+        raise ValueError('Неизвестный набор требований профиля.')
     if not isinstance(payload['font'], str) or payload['font'] not in (
         'Times New Roman', 'Arial', 'Calibri',
     ):
@@ -206,23 +233,35 @@ def profile_from_json(data: bytes) -> Profile:
         value = payload[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
             raise ValueError(f'Недопустимое значение параметра {name}.')
-    return Profile(**payload)
+    for name, low, high in [('table_size', 8, 18), ('table_line_spacing', 1, 2)]:
+        value = payload.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high):
+            raise ValueError(f'Недопустимое значение параметра {name}.')
+    profile = Profile(**payload)
+    if profile.ruleset == 'misis' and profile != MISIS:
+        raise ValueError('Профиль МИСИС фиксирован методичкой. Для других параметров выберите ruleset="custom".')
+    return profile
 
 
-def safe_docx_filename(name: str) -> str:
+def safe_docx_filename(name: str, *, custom_name: str | None = None) -> str:
     """Use a name without path components/control characters in ZIP exports."""
+    custom = custom_name is not None and bool(custom_name.strip())
+    name = custom_name if custom else name
     name = name.replace('\\', '/').split('/')[-1].strip()
     name = re.sub(r'[\x00-\x1f<>:"|?*]', '_', name)
-    stem = Path(name).stem[:90] or 'document'
-    return stem + '_GOST.docx'
+    stem = ((name[:-5] if name.lower().endswith('.docx') else name) if custom else Path(name).stem)
+    stem = stem.strip(' .')[:90] or 'document'
+    if stem.upper() in ('CON', 'PRN', 'AUX', 'NUL') or re.fullmatch(r'(?:COM|LPT)[1-9]', stem.upper()):
+        stem = '_' + stem
+    return stem + ('' if custom else '_GOST') + '.docx'
 
 
-def zip_results(files: list[tuple[str, bytes]], report: bytes | None = None) -> bytes:
+def zip_results(files: list[tuple[str, bytes]], report: bytes | None = None, *, custom_names: bool = False) -> bytes:
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         used = set()
         for name, data in files:
-            filename = safe_docx_filename(name)
+            filename = safe_docx_filename(name, custom_name=name if custom_names else None)
             stem = filename.removesuffix('.docx')
             n = 2
             while filename.casefold() in used:
@@ -243,6 +282,17 @@ def demo_docx() -> bytes:
     p.runs[0].font.size = __import__('docx').shared.Pt(16)
     doc.add_heading('1 Общие положения', level=1)
     doc.add_paragraph('Загрузите этот файл в GOST DOC и оцените найденные замечания.')
+    doc.add_paragraph('Таблица 1 – Демонстрационные результаты')
+    table = doc.add_table(rows=2, cols=2)
+    for row, values in zip(table.rows, [('Показатель', 'Значение'), ('Тестовый результат', '42')]):
+        for cell, value in zip(row.cells, values):
+            cell.text = value
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            paragraph.paragraph_format.first_line_indent = Cm(1.25)
+            paragraph.paragraph_format.line_spacing = 1.5
+            paragraph.runs[0].font.size = __import__('docx').shared.Pt(12)
+    doc.add_paragraph('Таким образом, проверка должна найти и исправить параметры таблицы.')
     section = doc.sections[0]
     section.left_margin = Cm(1)
     section.right_margin = Cm(1)
