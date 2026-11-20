@@ -22,6 +22,8 @@ from gostdoc.workflow import (
     safe_docx_filename,
     zip_results,
 )
+from gostdoc.criteria import CATALOG, criteria_rows
+from gostdoc.preview import render_docx, reference_preview, pdf_preview
 
 st.set_page_config(
     page_title='GOST DOC · Оформление документов',
@@ -40,7 +42,14 @@ st.markdown(
       --blue: #0541f0;
       --canvas: #ffffff;
     }
-    html, body, [class*="css"] {font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;}
+    html, body, [data-testid="stAppViewContainer"] {
+      font-family: Helvetica, "Helvetica Neue", Arial, sans-serif; font-weight:700;
+    }
+    [data-testid="stAppViewContainer"] :is(h1,h2,h3,h4,h5,h6,p,label,input,textarea,button,select),
+    .gd-logo, .gd-step, .gd-section, .gd-note, .gd-footer {
+      font-family: Helvetica, "Helvetica Neue", Arial, sans-serif !important;
+      font-weight:700 !important;
+    }
     [data-testid="stAppViewContainer"] {background: var(--canvas);}
     [data-testid="stSidebar"] {background: #ffffff; border-right: 1px solid var(--border);}
     [data-testid="stSidebar"] .block-container {padding-top: 1.8rem;}
@@ -200,12 +209,22 @@ with workspace:
     if check_only:
         st.info('Проверка самостоятельного оформления: исходный файл не изменяется. Замечания можно скачать в CSV.')
     valid_files = []
+    output_names = []
     if uploads:
         try:
             valid_files = read_uploads(uploads)
         except (ValueError, OSError, KeyError) as error:
             st.error(str(error))
         if valid_files:
+            if not check_only:
+                with st.expander('Имена готовых файлов', expanded=True):
+                    st.caption('Можно указать своё имя. По методичке: фамилия_группа_дисциплина_работа№N.')
+                    for index, (name, data) in enumerate(valid_files):
+                        requested = st.text_input(f'Имя итогового файла · {name}',
+                                                 value=safe_docx_filename(name, custom_name=name if cfg.ruleset == 'misis' else None),
+                                                 key=f'output_name_{index}_{hashlib.sha256(data).hexdigest()[:12]}')
+                        output_names.append(safe_docx_filename(name, custom_name=requested))
+                        st.caption('Будет скачан: ' + output_names[-1])
             st.caption(f'Загружено файлов: {len(valid_files)} · Максимум {MAX_BATCH_FILES} за один пакет.')
             summary = [cached_inspect(data) for _, data in valid_files]
             m1, m2, m3 = st.columns(3)
@@ -227,7 +246,43 @@ with workspace:
                     st.text_area('Текст документа · первые 5 000 символов', snippet,
                                  height=180, disabled=True)
 
-    st.markdown('<div class="gd-section">02 / Что сделать с документом</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gd-section">02 / Проверка и сравнение</div>', unsafe_allow_html=True)
+    reference = st.file_uploader('Эталон титульной страницы · DOCX или PDF', type=['docx', 'pdf'],
+                                 key='cover_reference',
+                                 help='Покажем первую страницу эталона рядом с исходной. ФИО, тема и содержание эталона не копируются в вашу работу.')
+    reference_bytes = reference.getvalue() if reference is not None else None
+    compare_key = hashlib.sha256((valid_files[0][1] if valid_files else b'') + (reference_bytes or b'')).hexdigest()
+    if st.button('Сравнить титульные страницы', disabled=not valid_files or reference is None):
+        try:
+            with st.spinner('Строим настоящие страницы документов…'):
+                original_view = render_docx(valid_files[0][1])
+                reference_view = reference_preview(reference_bytes, is_pdf=reference.name.lower().endswith('.pdf'))
+            st.session_state['gd_comparison'] = {'key': compare_key, 'original': original_view, 'reference': reference_view}
+        except (ValueError, OSError) as error:
+            st.error(str(error))
+    comparison = st.session_state.get('gd_comparison')
+    if comparison and comparison['key'] == compare_key:
+        left, right = st.columns(2)
+        with left:
+            st.markdown('**Исходный документ · первая страница**')
+            st.image(comparison['original']['images'][0], use_container_width=True)
+        with right:
+            st.markdown('**Загруженный эталон · первая страница**')
+            st.image(comparison['reference']['images'][0], use_container_width=True)
+        st.caption('Это рендер LibreOffice/PDF. Разметка может отличаться от Microsoft Word при замене шрифтов на сервере.')
+    if not check_only and st.button('Проверить исходное оформление', disabled=not valid_files):
+        source_issues = []
+        for name, data in valid_files:
+            source_issues.extend({**item, 'Место': f"{name} · {item['Место']}"} for item in cached_audit(data, cfg))
+        st.session_state['gd_source_audit'] = {'key': hashlib.sha256(json.dumps(
+            {'files': [hashlib.sha256(data).hexdigest() for _, data in valid_files], 'profile': cfg.summary()}, sort_keys=True).encode()).hexdigest(),
+            'issues': source_issues}
+    source_key = hashlib.sha256(json.dumps({'files': [hashlib.sha256(data).hexdigest() for _, data in valid_files],
+                                           'profile': cfg.summary()}, sort_keys=True).encode()).hexdigest()
+    source_audit = st.session_state.get('gd_source_audit')
+    if source_audit and source_audit['key'] == source_key and not check_only:
+        explain_issues(source_audit['issues'])
+    st.markdown('**Параметры исправления**')
     col_a, col_b = st.columns(2)
     batch = len(valid_files) > 1
     with col_a:
@@ -328,17 +383,18 @@ with workspace:
             if len(results) == 1:
                 item = results[0]
                 st.download_button('↓ Скачать готовый DOCX', item['output'],
-                                   safe_docx_filename(item['name']),
+                                   output_names[0],
                                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                                    type='primary', use_container_width=True)
             else:
-                package = zip_results([(item['name'], item['output']) for item in results], report=report)
+                package = zip_results([(output_names[i], item['output']) for i, item in enumerate(results)],
+                                      report=report, custom_names=True)
                 st.download_button('↓ Скачать все документы ZIP', package, 'GOST_DOC_results.zip',
                                    'application/zip', type='primary', use_container_width=True)
                 with st.expander('Скачать документы по отдельности'):
                     for i, item in enumerate(results):
-                        st.download_button(f"↓ {item['name']}", item['output'],
-                                           safe_docx_filename(item['name']),
+                        st.download_button(f"↓ {output_names[i]}", item['output'],
+                                           output_names[i],
                                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                                            key=f'file_download_{i}')
             st.download_button('↓ Скачать отчёт проверки CSV', report, 'GOST_DOC_audit.csv',
@@ -348,6 +404,22 @@ with workspace:
                 with st.expander(f'Что проверить вручную · {len(warnings)} пункт(ов)'):
                     for warning in warnings:
                         st.write('• ' + warning)
+            first = results[0]
+            preview_key = hashlib.sha256(first['output']).hexdigest()
+            if st.button('Показать страницы исправленного документа'):
+                try:
+                    with st.spinner('Рендерим исправленный DOCX…'):
+                        rendered = render_docx(first['output'])
+                    st.session_state['gd_result_preview'] = {'key': preview_key, **rendered}
+                except (ValueError, OSError) as error:
+                    st.error(str(error))
+            rendered = st.session_state.get('gd_result_preview')
+            if rendered and rendered['key'] == preview_key:
+                page_number = st.number_input('Страница исправленного документа', 1, rendered['page_count'], 1)
+                image = (rendered['images'][0] if page_number == 1 else
+                         pdf_preview(rendered['pdf'], start_page=page_number - 1)['images'][0])
+                st.image(image, caption=f"Исправленный документ · страница {page_number} из {rendered['page_count']}", use_container_width=True)
+                st.caption('Настоящий рендер LibreOffice. Проверьте финальную вёрстку в Word перед сдачей.')
             with st.expander('Сравнение текста первого документа'):
                 first = results[0]
                 left, right = st.columns(2)
@@ -398,6 +470,11 @@ with review:
             st.caption('Отсутствие замечаний не означает полного соответствия ГОСТ. Сложные элементы нужно проверять в Word.')
 
 with preferences:
+    st.markdown('### Критерии из методички')
+    st.caption(f"{CATALOG['source']['file']} · {CATALOG['source']['year']} · {CATALOG['source']['pages']} страниц")
+    st.write(CATALOG['source']['grading'])
+    st.dataframe(criteria_rows(), hide_index=True, use_container_width=True)
+    st.caption('Каждое требование связано со страницей PDF. Неавтоматизированный критерий остаётся непроверенным.')
     st.markdown('### Профиль оформления')
     st.write('Здесь можно сохранить настройки для повторного использования и посмотреть действующие параметры.')
     c1, c2 = st.columns([2, 1])

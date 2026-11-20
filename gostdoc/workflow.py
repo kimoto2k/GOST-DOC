@@ -93,6 +93,8 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     """
     doc = get_document(content)
     issues = []
+    if cfg.ruleset == 'misis' and cfg != MISIS:
+        raise ValueError('Параметры МИСИС должны совпадать с методичкой.')
 
     def add(level: str, kind: str, location: str, details: str):
         issues.append({
@@ -104,6 +106,8 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
 
     for item in diagnostics(content, cfg):
         detail = item['Проблема']
+        if cfg.ruleset == 'misis' and not item['Элемент'].startswith('Раздел '):
+            continue  # Role-aware checks below replace overlapping basic checks.
         if detail.startswith(('Левое', 'Правое', 'Верхнее', 'Нижнее', 'Формат')):
             add('Ошибка', 'Страница', item['Элемент'], detail)
         elif detail.startswith('Шрифт') or detail.startswith('Размер'):
@@ -114,6 +118,8 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
     captions = {caption._p for _, table in iter_tables(doc)
                 for caption, _ in [table_neighbors(table)] if caption is not None} if cfg.ruleset == 'misis' else set()
     for i, p in enumerate(doc.paragraphs, 1):
+        if cfg.ruleset == 'misis':
+            continue
         if not p.text.strip() or is_heading(p) or is_list(p) or p._p in captions:
             continue
         loc = f'Абзац {i}'
@@ -141,6 +147,9 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
                     add('Замечание', 'Цвет', loc, 'Текст не чёрный.')
             break
 
+    if cfg.ruleset == 'misis':
+        from .misis import audit_paragraphs
+        issues.extend(audit_paragraphs(doc, cfg))
     issues.extend(audit_tables(doc, cfg))
     if doc.tables:
         add('Проверить вручную', 'Таблицы', 'Документ',
@@ -155,6 +164,12 @@ def audit_document(content: bytes, cfg: Profile = STANDARD) -> list[dict]:
         add('Проверить вручную', 'Методичка МИСИС', 'Документ',
             'Контекстные интервалы и нумерация заголовков, кафедральный титул, содержание, '
             'формулы, ссылки, источники и реальная вёрстка не проходят полный автоматический контроль.')
+        if not any(re.search(r'\bцел(?:ь|ью|и)\b', p.text, re.I) for p in doc.paragraphs):
+            add('Проверить вручную', 'Содержание работы', 'Документ',
+                'Не найдена явно обозначенная цель работы. Проверьте требование стр. 5; цель не добавляется автоматически.')
+        if doc.element.xpath('.//w:sdt'):
+            add('Проверить вручную', 'Элементы управления Word', 'Документ',
+                'Обнаружены элементы Rich Text/SDT. Их содержимое сохраняется; проверьте вложенные стили и титульник по стр. 14–15.')
 
     # Deduplicate when a basic diagnostic and a style-based check describe one issue.
     seen = set()
@@ -228,20 +243,25 @@ def profile_from_json(data: bytes) -> Profile:
     return profile
 
 
-def safe_docx_filename(name: str) -> str:
+def safe_docx_filename(name: str, *, custom_name: str | None = None) -> str:
     """Use a name without path components/control characters in ZIP exports."""
+    custom = custom_name is not None and bool(custom_name.strip())
+    name = custom_name if custom else name
     name = name.replace('\\', '/').split('/')[-1].strip()
     name = re.sub(r'[\x00-\x1f<>:"|?*]', '_', name)
-    stem = Path(name).stem[:90] or 'document'
-    return stem + '_GOST.docx'
+    stem = ((name[:-5] if name.lower().endswith('.docx') else name) if custom else Path(name).stem)
+    stem = stem.strip(' .')[:90] or 'document'
+    if stem.upper() in ('CON', 'PRN', 'AUX', 'NUL') or re.fullmatch(r'(?:COM|LPT)[1-9]', stem.upper()):
+        stem = '_' + stem
+    return stem + ('' if custom else '_GOST') + '.docx'
 
 
-def zip_results(files: list[tuple[str, bytes]], report: bytes | None = None) -> bytes:
+def zip_results(files: list[tuple[str, bytes]], report: bytes | None = None, *, custom_names: bool = False) -> bytes:
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         used = set()
         for name, data in files:
-            filename = safe_docx_filename(name)
+            filename = safe_docx_filename(name, custom_name=name if custom_names else None)
             stem = filename.removesuffix('.docx')
             n = 2
             while filename.casefold() in used:

@@ -4,7 +4,7 @@ primaryColor = "#0541F0"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F1F2FE"
 textColor = "#0A1E64"
-font = "sans serif"
+font = "Helvetica, Helvetica Neue, Arial, sans-serif"
 
 [server]
 maxUploadSize = 15

@@ -6,20 +6,22 @@ from docx.shared import Length
 
 from .document import iter_cells, iter_runs, iter_tables, paragraph_value, run_value
 from .formatter import is_list, table_neighbors
+from .misis import is_equation_table
 
 
 def audit_tables(doc, cfg):
     issues = []
+    category = 'Таблицы'
 
     def add(level, location, text):
-        issues.append({'Уровень': level, 'Категория': 'Таблицы',
+        issues.append({'Уровень': level, 'Категория': category,
                        'Место': location, 'Замечание': text})
 
-    def check_paragraph(p, location, expected, *, before=0):
+    def check_paragraph(p, location, expected, *, before=0, alignment=WD_ALIGN_PARAGRAPH.LEFT):
         if is_list(p):
             add('Проверить вручную', location, 'В ячейке сохранён список; проверьте отступы и маркеры Word.')
-        if paragraph_value(p, 'alignment', doc) != WD_ALIGN_PARAGRAPH.LEFT:
-            add('Ошибка', location, 'Текст должен быть выровнен по левому краю.')
+        if paragraph_value(p, 'alignment', doc) != alignment:
+            add('Ошибка', location, f'Выравнивание текста: требуется {alignment.name}.')
         for attr, label in [('first_line_indent', 'Красная строка'),
                             ('left_indent', 'Отступ слева'), ('right_indent', 'Отступ справа')]:
             value = paragraph_value(p, attr, doc)
@@ -48,6 +50,19 @@ def audit_tables(doc, cfg):
             add('Ошибка', location, f'Размер: {", ".join(f"{size:g}" for size in wrong_sizes)} пт; требуется {expected.size:g} пт.')
 
     for location, table in iter_tables(doc):
+        if cfg.ruleset == 'misis':
+            from .cover import cover_elements, inside_cover
+            if inside_cover(table._tbl, set(cover_elements(doc))):
+                add('Проверить вручную', location, 'Таблица принадлежит титульному листу; сравните его с эталоном (стр. 9).')
+                continue
+        category = 'Формулы' if cfg.ruleset == 'misis' and is_equation_table(table) else 'Таблицы'
+        if category == 'Формулы':
+            for column, cell in enumerate(table.rows[0].cells):
+                for index, p in enumerate(cell.paragraphs, 1):
+                    check_paragraph(p, f'{location}, формула, ячейка {column + 1}, абзац {index}', cfg,
+                                    alignment=(WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.RIGHT)[column])
+            add('Проверить вручную', location, 'Проверьте смысл формулы, пояснения «где», нумерацию и отсутствие границ (стр. 10).')
+            continue
         if cfg.ruleset == 'misis':
             if table.alignment != WD_TABLE_ALIGNMENT.CENTER:
                 add('Ошибка', location, 'Таблица должна быть расположена по центру.')
